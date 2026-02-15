@@ -6,7 +6,8 @@
       "env": {
         "OLLAMA_BASE_URL": "http://localhost:11434",
         "OLLAMA_EMBED_MODEL": "embeddinggemma",
-        "MEMORY_DB_PATH": "./data/memory.db",
+        "MEMORY_DB_PATH": "./data/memory.zvec",
+        "EMBEDDING_DIM": "768",
         "WORKSPACE_KEY": "default"
       }
     }

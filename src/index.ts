@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { embedWithOllama } from "./ollama";
+import { embedText } from "./embed.js";
 import {
   openDb,
   saveMemory,
@@ -10,7 +10,7 @@ import {
   supersedeMemory,
   deleteMemory,
   type MemoryType,
-} from "./db";
+} from "./db.js";
 
 const server = new McpServer({
   name: "local-memory-mcp",
@@ -37,21 +37,16 @@ function workspaceKeyFrom(input?: string) {
   );
 }
 
-server.registerTool(
-  "memory.ping",
-  { inputSchema: {} },
-  async () => {
-    const { v } = db.query("select vec_version() as v;").get() as any;
-    return {
-      content: [
-        {
-          type: "text",
-          text: `ok\nvec_version=${v}\ndb=${process.env.MEMORY_DB_PATH ?? "./data/memory.db"}`,
-        },
-      ],
-    };
-  }
-);
+server.registerTool("memory.ping", { inputSchema: {} }, async () => {
+  return {
+    content: [
+      {
+        type: "text",
+        text: `ok\nengine=zvec\nstore=${db.path}\ndim=${db.dimension}`,
+      },
+    ],
+  };
+});
 
 server.registerTool(
   "memory.search",
@@ -66,7 +61,7 @@ server.registerTool(
   async ({ query, topK, workspaceKey, type }) => {
     const ws = workspaceKeyFrom(workspaceKey);
 
-    const [qEmbedding] = await embedWithOllama({ input: query });
+    const [qEmbedding] = await embedText(query);
 
     const results = searchMemory(db, {
       workspaceKey: ws,
@@ -77,7 +72,7 @@ server.registerTool(
 
     const lines = results.map(
       (r) =>
-        `- (#${r.id}, ${r.type}, dist=${r.distance.toFixed(4)}) ${r.summary.replace(/\s+/g, " ")}`
+        `- (#${r.id}, ${r.type}, dist=${r.distance.toFixed(4)}) ${r.summary.replace(/\s+/g, " ")}`,
     );
 
     const payload = {
@@ -108,7 +103,7 @@ server.registerTool(
         },
       ],
     };
-  }
+  },
 );
 
 server.registerTool(
@@ -130,8 +125,7 @@ server.registerTool(
   async ({ workspaceKey, type, text, summary, tags, importance }) => {
     const ws = workspaceKeyFrom(workspaceKey);
 
-    // Embed the full text (or you can embed summary + text). Keep it simple.
-    const [embedding] = await embedWithOllama({ input: text });
+    const [embedding] = await embedText(text);
 
     const item = saveMemory(db, {
       workspaceKey: ws,
@@ -151,7 +145,7 @@ server.registerTool(
         },
       ],
     };
-  }
+  },
 );
 
 server.registerTool(
@@ -172,7 +166,7 @@ server.registerTool(
         },
       ],
     };
-  }
+  },
 );
 
 server.registerTool(
@@ -206,7 +200,7 @@ server.registerTool(
         },
       ],
     };
-  }
+  },
 );
 
 // Start stdio transport (for VS Code MCP / Claude Desktop style integrations)

@@ -6,12 +6,13 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun --watch src/index.ts",
+    "test": "bun test",
     "format": "bunx prettier -w .",
     "lint": "bunx eslint ."
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
-    "sqlite-vec": "^0.1.7-alpha.2",
+    "@zvec/zvec": "^0.2.0",
     "zod": "^3.25.0"
   },
   "devDependencies": {

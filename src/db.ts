@@ -1,5 +1,9 @@
-import { Database } from "bun:sqlite";
-import * as sqliteVec from "sqlite-vec";
+import { createRequire } from "node:module";
+import { existsSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+
+const require = createRequire(import.meta.url);
+const zvec = require("@zvec/zvec") as typeof import("@zvec/zvec");
 
 export type MemoryType =
   | "decision"
@@ -24,220 +28,330 @@ export type MemoryItem = {
 
 export type SearchResult = MemoryItem & { distance: number };
 
-const DEFAULT_DB_PATH = "./data/memory.db";
+export type MemoryDb = {
+  collection: import("@zvec/zvec").ZVecCollection;
+  path: string;
+  dimension: number;
+  idSeed: number;
+};
+
+const DEFAULT_DB_PATH = "./data/memory.zvec";
 const DEFAULT_DIM = 768;
 
-export function openDb(dbPath = process.env.MEMORY_DB_PATH ?? DEFAULT_DB_PATH): Database {
-  // On macOS, Bun may use Apple's SQLite which disables extension loading.
-  // If you hit extension-loading errors, set CUSTOM_SQLITE_PATH to a SQLite build that supports extensions.
-  // See: https://bun.com/reference/bun/sqlite/Database/loadExtension
-  // and sqlite-vec Bun recipe.
-  const custom = process.env.CUSTOM_SQLITE_PATH;
-  if (custom) {
-    Database.setCustomSQLite(custom);
+export function openDb(
+  dbPath = process.env.MEMORY_DB_PATH ?? DEFAULT_DB_PATH,
+): MemoryDb {
+  const normalizedPath = normalizePath(dbPath);
+  mkdirSync(dirname(normalizedPath), { recursive: true });
+
+  const dimension = Number(process.env.EMBEDDING_DIM ?? DEFAULT_DIM);
+  if (!Number.isFinite(dimension) || dimension <= 0) {
+    throw new Error("Invalid EMBEDDING_DIM");
   }
 
-  const db = new Database(dbPath);
-  db.query("PRAGMA journal_mode=WAL;").run();
-  db.query("PRAGMA synchronous=NORMAL;").run();
+  let collection: import("@zvec/zvec").ZVecCollection;
+  if (existsSync(normalizedPath)) {
+    collection = zvec.ZVecOpen(normalizedPath);
+  } else {
+    const schema = new zvec.ZVecCollectionSchema({
+      name: "memory",
+      vectors: {
+        name: "embedding",
+        dataType: zvec.ZVecDataType.VECTOR_FP32,
+        dimension,
+      },
+      fields: [
+        { name: "id", dataType: zvec.ZVecDataType.INT64 },
+        { name: "workspaceKey", dataType: zvec.ZVecDataType.STRING },
+        { name: "type", dataType: zvec.ZVecDataType.STRING },
+        { name: "text", dataType: zvec.ZVecDataType.STRING },
+        { name: "summary", dataType: zvec.ZVecDataType.STRING },
+        {
+          name: "tagsJson",
+          dataType: zvec.ZVecDataType.STRING,
+          nullable: true,
+        },
+        { name: "importance", dataType: zvec.ZVecDataType.DOUBLE },
+        { name: "createdAt", dataType: zvec.ZVecDataType.STRING },
+        {
+          name: "lastUsedAt",
+          dataType: zvec.ZVecDataType.STRING,
+          nullable: true,
+        },
+        { name: "supersededBy", dataType: zvec.ZVecDataType.INT64 },
+      ],
+    });
 
-  // Load sqlite-vec extension into this connection.
-  sqliteVec.load(db);
+    collection = zvec.ZVecCreateAndOpen(normalizedPath, schema);
+  }
 
-  initSchema(db);
-  return db;
+  return {
+    collection,
+    path: normalizedPath,
+    dimension,
+    idSeed: Date.now() * 1000,
+  };
 }
 
-function initSchema(db: Database) {
-  const dim = Number(process.env.EMBEDDING_DIM ?? DEFAULT_DIM);
-  if (!Number.isFinite(dim) || dim <= 0) throw new Error("Invalid EMBEDDING_DIM");
+export function saveMemory(
+  db: MemoryDb,
+  input: {
+    workspaceKey: string;
+    type: MemoryType;
+    text: string;
+    summary: string;
+    tagsJson?: string | null;
+    importance?: number;
+    embedding: Float32Array;
+  },
+): MemoryItem {
+  ensureEmbeddingDim(input.embedding, db.dimension);
 
-  db.query(`
-    CREATE TABLE IF NOT EXISTS memory_items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      workspace_key TEXT NOT NULL,
-      type TEXT NOT NULL,
-      text TEXT NOT NULL,
-      summary TEXT NOT NULL,
-      tags_json TEXT,
-      importance REAL NOT NULL DEFAULT 0.5,
-      created_at TEXT NOT NULL,
-      last_used_at TEXT,
-      superseded_by INTEGER
-    );
-  `).run();
-
-  // vec0 virtual tables require an integer primary key column.
-  // vec0 supports metadata columns and partition keys.
-  // Docs: https://alexgarcia.xyz/sqlite-vec/features/vec0.html
-  db.query(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS vec_memory USING vec0(
-      memory_id INTEGER PRIMARY KEY,
-      workspace_key TEXT PARTITION KEY,
-      type TEXT,
-      embedding FLOAT[${dim}]
-    );
-  `).run();
-
-  db.query(`
-    CREATE INDEX IF NOT EXISTS idx_memory_items_workspace ON memory_items(workspace_key);
-  `).run();
-}
-
-export function saveMemory(db: Database, input: {
-  workspaceKey: string;
-  type: MemoryType;
-  text: string;
-  summary: string;
-  tagsJson?: string | null;
-  importance?: number;
-  embedding: Float32Array;
-}): MemoryItem {
+  const id = nextId(db);
   const createdAt = new Date().toISOString();
   const importance = input.importance ?? 0.5;
 
-  const insertItem = db.query(
-    `INSERT INTO memory_items (workspace_key, type, text, summary, tags_json, importance, created_at)
-     VALUES ($workspace_key, $type, $text, $summary, $tags_json, $importance, $created_at)
-     RETURNING id, workspace_key, type, text, summary, tags_json, importance, created_at, last_used_at, superseded_by`
-  );
-
-  const row = insertItem.get({
-    $workspace_key: input.workspaceKey,
-    $type: input.type,
-    $text: input.text,
-    $summary: input.summary,
-    $tags_json: input.tagsJson ?? null,
-    $importance: importance,
-    $created_at: createdAt,
-  }) as any;
-
-  const memoryId = Number(row.id);
-
-  // Keep the vec table in sync.
-  const insertVec = db.query(
-    `INSERT INTO vec_memory (memory_id, workspace_key, type, embedding)
-     VALUES ($memory_id, $workspace_key, $type, $embedding)`
-  );
-
-  // bun:sqlite can bind Float32Array directly (sqlite-vec Bun recipe).
-  insertVec.run({
-    $memory_id: memoryId,
-    $workspace_key: input.workspaceKey,
-    $type: input.type,
-    $embedding: input.embedding,
+  const status = db.collection.insertSync({
+    id: String(id),
+    vectors: { embedding: input.embedding },
+    fields: {
+      id,
+      workspaceKey: input.workspaceKey,
+      type: input.type,
+      text: input.text,
+      summary: input.summary,
+      tagsJson: input.tagsJson ?? "",
+      importance,
+      createdAt,
+      lastUsedAt: "",
+      supersededBy: 0,
+    },
   });
+  ensureStatusOk(status, "insertSync");
 
-  return mapItemRow(row);
+  return {
+    id,
+    workspaceKey: input.workspaceKey,
+    type: input.type,
+    text: input.text,
+    summary: input.summary,
+    tagsJson: input.tagsJson ?? null,
+    importance,
+    createdAt,
+    lastUsedAt: null,
+    supersededBy: null,
+  };
 }
 
-export function searchMemory(db: Database, input: {
-  workspaceKey: string;
-  queryEmbedding: Float32Array;
-  topK?: number;
-  type?: MemoryType;
-}): SearchResult[] {
+export function searchMemory(
+  db: MemoryDb,
+  input: {
+    workspaceKey: string;
+    queryEmbedding: Float32Array;
+    topK?: number;
+    type?: MemoryType;
+  },
+): SearchResult[] {
+  ensureEmbeddingDim(input.queryEmbedding, db.dimension);
+
   const topK = Math.max(1, Math.min(50, input.topK ?? 8));
-
-  // KNN query: must include "embedding match" and "k = N" in WHERE.
-  // Docs: https://alexgarcia.xyz/sqlite-vec/features/vec0.html
-  const stmt = db.query(
-    `
-    SELECT
-      mi.id,
-      mi.workspace_key,
-      mi.type,
-      mi.text,
-      mi.summary,
-      mi.tags_json,
-      mi.importance,
-      mi.created_at,
-      mi.last_used_at,
-      mi.superseded_by,
-      vm.distance
-    FROM vec_memory vm
-    JOIN memory_items mi ON mi.id = vm.memory_id
-    WHERE vm.embedding MATCH $q
-      AND k = $k
-      AND vm.workspace_key = $workspace_key
-      ${input.type ? "AND vm.type = $type" : ""}
-      AND mi.superseded_by IS NULL
-    `
-  );
-
-  const rows = stmt.all({
-    $q: input.queryEmbedding,
-    $k: topK,
-    $workspace_key: input.workspaceKey,
-    ...(input.type ? { $type: input.type } : {}),
-  }) as any[];
-
-  const now = new Date().toISOString();
-  const touch = db.query(`UPDATE memory_items SET last_used_at = $now WHERE id = $id`);
-
-  const results: SearchResult[] = rows.map((r) => ({ ...mapItemRow(r), distance: Number(r.distance) }));
-  for (const r of results) {
-    touch.run({ $now: now, $id: r.id });
+  const filterParts = [
+    `workspaceKey = '${escapeForFilter(input.workspaceKey)}'`,
+    "supersededBy = 0",
+  ];
+  if (input.type) {
+    filterParts.push(`type = '${escapeForFilter(input.type)}'`);
   }
 
-  // Simple re-rank: combine distance with importance.
-  // Distance is smaller=better.
+  let docs: import("@zvec/zvec").ZVecDoc[] = [];
+  try {
+    docs = db.collection.querySync({
+      fieldName: "embedding",
+      vector: input.queryEmbedding,
+      topk: topK,
+      filter: filterParts.join(" AND "),
+      outputFields: [
+        "id",
+        "workspaceKey",
+        "type",
+        "text",
+        "summary",
+        "tagsJson",
+        "importance",
+        "createdAt",
+        "lastUsedAt",
+        "supersededBy",
+      ],
+    });
+  } catch {
+    docs = db.collection.querySync({
+      fieldName: "embedding",
+      vector: input.queryEmbedding,
+      topk: 200,
+      outputFields: [
+        "id",
+        "workspaceKey",
+        "type",
+        "text",
+        "summary",
+        "tagsJson",
+        "importance",
+        "createdAt",
+        "lastUsedAt",
+        "supersededBy",
+      ],
+    });
+    docs = docs
+      .filter((doc) => {
+        const fields = doc.fields ?? {};
+        const sameWorkspace =
+          String(fields.workspaceKey ?? "") === input.workspaceKey;
+        const sameType = input.type
+          ? String(fields.type ?? "") === input.type
+          : true;
+        const active = Number(fields.supersededBy ?? 0) === 0;
+        return sameWorkspace && sameType && active;
+      })
+      .slice(0, topK);
+  }
+
+  const now = new Date().toISOString();
+  const results: SearchResult[] = docs.map((doc) => {
+    const row = mapDocToItem(doc);
+    return {
+      ...row,
+      distance: 1 - Number(doc.score ?? 0),
+    };
+  });
+
+  for (const r of results) {
+    try {
+      db.collection.updateSync({
+        id: String(r.id),
+        fields: {
+          lastUsedAt: now,
+        },
+      });
+      r.lastUsedAt = now;
+    } catch {
+      // best effort
+    }
+  }
+
   results.sort((a, b) => score(a) - score(b));
   return results;
 
   function score(r: SearchResult): number {
     const dist = r.distance;
-    const imp = 1 - Math.max(0, Math.min(1, r.importance)); // higher importance => lower score
+    const imp = 1 - Math.max(0, Math.min(1, r.importance));
     return dist + imp * 0.15 * 0.05;
   }
 }
 
-export function supersedeMemory(db: Database, input: { id: number; supersededBy: number }): void {
-  db.query(`UPDATE memory_items SET superseded_by = $superseded_by WHERE id = $id`).run({
-    $id: input.id,
-    $superseded_by: input.supersededBy,
+export function supersedeMemory(
+  db: MemoryDb,
+  input: { id: number; supersededBy: number },
+): void {
+  const doc = findOneByMemoryId(db, input.id);
+  if (!doc) return;
+
+  db.collection.updateSync({
+    id: doc.id,
+    fields: {
+      supersededBy: input.supersededBy,
+    },
   });
 }
 
-export function deleteMemory(db: Database, input: { id: number; workspaceKey?: string }): MemoryItem | null {
-  const row = db
-    .query(
-      `SELECT id, workspace_key, type, text, summary, tags_json, importance, created_at, last_used_at, superseded_by
-       FROM memory_items
-       WHERE id = $id
-       ${input.workspaceKey ? "AND workspace_key = $workspace_key" : ""}`
-    )
-    .get({
-      $id: input.id,
-      ...(input.workspaceKey ? { $workspace_key: input.workspaceKey } : {}),
-    }) as any;
+export function deleteMemory(
+  db: MemoryDb,
+  input: { id: number; workspaceKey?: string },
+): MemoryItem | null {
+  const doc = findOneByMemoryId(db, input.id);
+  if (!doc) return null;
 
-  if (!row) return null;
-
-  db.query("BEGIN;").run();
-  try {
-    db.query(`DELETE FROM vec_memory WHERE memory_id = $id`).run({ $id: input.id });
-    db.query(`DELETE FROM memory_items WHERE id = $id`).run({ $id: input.id });
-    db.query("COMMIT;").run();
-  } catch (err) {
-    db.query("ROLLBACK;").run();
-    throw err;
+  const item = mapDocToItem(doc);
+  if (input.workspaceKey && item.workspaceKey !== input.workspaceKey) {
+    return null;
   }
 
-  return mapItemRow(row);
+  const status = db.collection.deleteSync(doc.id);
+  ensureStatusOk(status, "deleteSync");
+  return item;
 }
 
-function mapItemRow(row: any): MemoryItem {
+function findOneByMemoryId(
+  db: MemoryDb,
+  id: number,
+): import("@zvec/zvec").ZVecDoc | null {
+  const docs = db.collection.querySync({
+    filter: `id = ${id}`,
+    topk: 1,
+    outputFields: [
+      "id",
+      "workspaceKey",
+      "type",
+      "text",
+      "summary",
+      "tagsJson",
+      "importance",
+      "createdAt",
+      "lastUsedAt",
+      "supersededBy",
+    ],
+  });
+  return docs.length ? docs[0] : null;
+}
+
+function mapDocToItem(doc: import("@zvec/zvec").ZVecDoc): MemoryItem {
+  const fields = doc.fields ?? {};
+  const supersededBy = Number(fields.supersededBy ?? 0);
+
   return {
-    id: Number(row.id),
-    workspaceKey: String(row.workspace_key),
-    type: row.type as MemoryType,
-    text: String(row.text),
-    summary: String(row.summary),
-    tagsJson: row.tags_json == null ? null : String(row.tags_json),
-    importance: Number(row.importance),
-    createdAt: String(row.created_at),
-    lastUsedAt: row.last_used_at == null ? null : String(row.last_used_at),
-    supersededBy: row.superseded_by == null ? null : Number(row.superseded_by),
+    id: Number(fields.id ?? doc.id),
+    workspaceKey: String(fields.workspaceKey ?? "default"),
+    type: String(fields.type ?? "fact") as MemoryType,
+    text: String(fields.text ?? ""),
+    summary: String(fields.summary ?? ""),
+    tagsJson: String(fields.tagsJson ?? "") || null,
+    importance: Number(fields.importance ?? 0.5),
+    createdAt: String(fields.createdAt ?? new Date(0).toISOString()),
+    lastUsedAt: String(fields.lastUsedAt ?? "") || null,
+    supersededBy: supersededBy > 0 ? supersededBy : null,
   };
+}
+
+function nextId(db: MemoryDb): number {
+  db.idSeed += 1;
+  return db.idSeed;
+}
+
+function ensureStatusOk(
+  status: import("@zvec/zvec").ZVecStatus,
+  operation: string,
+) {
+  if (!status.ok) {
+    throw new Error(
+      `${operation} failed: ${status.code} ${status.message}`.trim(),
+    );
+  }
+}
+
+function ensureEmbeddingDim(embedding: Float32Array, expected: number) {
+  if (embedding.length !== expected) {
+    throw new Error(
+      `Embedding dimension mismatch: expected ${expected}, got ${embedding.length}`,
+    );
+  }
+}
+
+function normalizePath(path: string): string {
+  if (path.endsWith(".db")) {
+    return path.replace(/\.db$/, ".zvec");
+  }
+  return path;
+}
+
+function escapeForFilter(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }

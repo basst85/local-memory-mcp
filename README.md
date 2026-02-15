@@ -24,13 +24,11 @@ This project is a **local MCP (Model Context Protocol) server** that exposes a s
 4. New durable insight is stored via `memory.save`.
 5. Old memory is updated via `memory.supersede` or removed via `memory.delete`.
 
-
 It uses:
 
 - **Bun** + **TypeScript**
-- **bun:sqlite** for a local SQLite DB (fast, embedded) (docs: https://bun.com/docs/runtime/sqlite)
-- **sqlite-vec** to do KNN vector search via a `vec0` virtual table (docs + Bun recipe: https://alexgarcia.xyz/sqlite-vec/js.html, vec0 docs: https://alexgarcia.xyz/sqlite-vec/features/vec0.html)
-- **Ollama** `/api/embed` with `embeddinggemma` for embeddings (docs: https://docs.ollama.com/capabilities/embeddings, model page: https://ollama.com/library/embeddinggemma)
+- **Zvec** (`@zvec/zvec`) as embedded in-process vector database (docs: https://zvec.org/en/docs/)
+- **Ollama** `/api/embed` with **embeddinggemma** for embeddings (docs: https://docs.ollama.com/capabilities/embeddings, model: https://ollama.com/library/embeddinggemma)
 
 ## Prerequisites
 
@@ -57,18 +55,24 @@ bun run start
 
 This runs an MCP server over **stdio**.
 
+## Test
+
+```bash
+bun run test
+```
+
+Current tests include:
+
+- `tests/embed.test.ts` – validates Ollama embedding response parsing and error handling
+- `tests/memory-db.test.ts` – validates `save`, `search`, `supersede`, and `delete` on the Zvec-backed store
+
 ### Environment variables
 
+- `MEMORY_DB_PATH` (default `./data/memory.zvec`)
 - `OLLAMA_BASE_URL` (default `http://localhost:11434`)
 - `OLLAMA_EMBED_MODEL` (default `embeddinggemma`)
-- `MEMORY_DB_PATH` (default `./data/memory.db`)
+- `EMBEDDING_DIM` (default `768`, must match your embedding model)
 - `WORKSPACE_KEY` (default `default`)
-
-### macOS note (SQLite extensions)
-
-On macOS, Bun may use Apple's SQLite build, which can disable extension loading. If `sqlite-vec` fails to load, set:
-
-- `CUSTOM_SQLITE_PATH=/path/to/libsqlite3.dylib`
 
 ## VS Code
 
@@ -96,16 +100,12 @@ Example (Linux):
     "local-memory-mcp": {
       "type": "stdio",
       "command": "bun",
-      "args": [
-        "--cwd",
-        "/path/to/local-memory-mcp",
-        "run",
-        "start"
-      ],
+      "args": ["--cwd", "/path/to/local-memory-mcp", "run", "start"],
       "env": {
+        "MEMORY_DB_PATH": "/path/to/local-memory-mcp/data/memory.zvec",
         "OLLAMA_BASE_URL": "http://localhost:11434",
         "OLLAMA_EMBED_MODEL": "embeddinggemma",
-        "MEMORY_DB_PATH": "/path/to/local-memory-mcp/data/memory.db",
+        "EMBEDDING_DIM": "768",
         "WORKSPACE_KEY": "${workspaceFolderBasename}"
       }
     }
@@ -136,9 +136,10 @@ This repository already includes:
 
 ```bash
 claude mcp add --transport stdio --scope user \
+  --env MEMORY_DB_PATH=/absolute/path/to/local-memory-mcp/data/memory.zvec \
   --env OLLAMA_BASE_URL=http://localhost:11434 \
   --env OLLAMA_EMBED_MODEL=embeddinggemma \
-  --env MEMORY_DB_PATH=/absolute/path/to/local-memory-mcp/data/memory.db \
+  --env EMBEDDING_DIM=768 \
   --env WORKSPACE_KEY=default \
   local-memory-mcp -- bun --cwd /absolute/path/to/local-memory-mcp run start
 ```
@@ -147,9 +148,10 @@ claude mcp add --transport stdio --scope user \
 
 ```bash
 claude mcp add --transport stdio --scope project \
+  --env MEMORY_DB_PATH=./data/memory.zvec \
   --env OLLAMA_BASE_URL=http://localhost:11434 \
   --env OLLAMA_EMBED_MODEL=embeddinggemma \
-  --env MEMORY_DB_PATH=./data/memory.db \
+  --env EMBEDDING_DIM=768 \
   --env WORKSPACE_KEY=${PWD##*/} \
   local-memory-mcp -- bun run start
 ```
@@ -164,9 +166,10 @@ Project `.mcp.json` example:
       "command": "bun",
       "args": ["run", "start"],
       "env": {
+        "MEMORY_DB_PATH": "./data/memory.zvec",
         "OLLAMA_BASE_URL": "http://localhost:11434",
         "OLLAMA_EMBED_MODEL": "embeddinggemma",
-        "MEMORY_DB_PATH": "./data/memory.db",
+        "EMBEDDING_DIM": "768",
         "WORKSPACE_KEY": "${PWD##*/}"
       }
     }
@@ -215,9 +218,9 @@ Docs:
   "arguments": {
     "workspaceKey": "my-repo",
     "type": "decision",
-    "summary": "We use embeddinggemma via local Ollama + sqlite-vec vec0 for long-term memory.",
-    "text": "Decision: The Copilot/agent memory sidecar uses Ollama /api/embed with embeddinggemma and stores vectors in sqlite-vec (vec0).",
-    "tags": ["memory", "ollama", "sqlite-vec"],
+    "summary": "We use zvec with Ollama embeddinggemma for long-term memory.",
+    "text": "Decision: The Copilot/agent memory sidecar stores vectors in zvec and generates embeddings via Ollama /api/embed using embeddinggemma.",
+    "tags": ["memory", "zvec", "ollama", "embeddinggemma"],
     "importance": 0.8
   }
 }
@@ -234,3 +237,28 @@ Docs:
   }
 }
 ```
+
+## Implementation notes
+
+- The DB uses one Zvec collection with:
+  - dense vector field `embedding`
+  - scalar fields for metadata (`workspaceKey`, `type`, `summary`, etc.)
+- KNN queries are executed through Zvec `querySync` with metadata filters.
+
+## Tests
+
+Run all tests:
+
+```bash
+bun run test
+```
+
+Current test coverage:
+
+- `tests/embed.test.ts`
+  - parses successful Ollama `/api/embed` responses into `Float32Array`
+  - verifies error handling when Ollama returns non-2xx responses
+- `tests/memory-db.test.ts`
+  - validates `save` + `search` behavior with workspace/type filtering
+  - validates `supersede` behavior (superseded items are excluded from search)
+  - validates `delete` behavior and returned payload semantics

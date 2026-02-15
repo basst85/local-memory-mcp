@@ -4,9 +4,8 @@ node_modules/
 .DS_Store
 
 # local data
-/data/*.db
-/data/*.db-shm
-/data/*.db-wal
+/data/*.zvec/
+/data/*.zvec
 
 # env
 .env
