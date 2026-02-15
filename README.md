@@ -234,10 +234,3 @@ Docs:
   }
 }
 ```
-
-## Implementation notes
-
-- The DB has two layers:
-  - `memory_items` – canonical memory text + metadata
-  - `vec_memory` – `vec0` table with a partition key (`workspace_key`) and a 768-dim embedding column
-- KNN queries follow sqlite-vec's pattern: `embedding MATCH ? AND k = N` plus optional metadata constraints.

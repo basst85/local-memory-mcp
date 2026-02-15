@@ -1,0 +1,15 @@
+node_modules/
+.bun/
+*.log
+.DS_Store
+
+# local data
+/data/*.db
+/data/*.db-shm
+/data/*.db-wal
+
+# env
+.env
+
+# editor
+.vscode/settings.json
