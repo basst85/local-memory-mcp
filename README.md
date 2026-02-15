@@ -1,4 +1,4 @@
-# Local Memory MCP Server for Coding Agents
+# Local Memory MCP Server for Coding/AI Agents
 
 This project is a **local MCP (Model Context Protocol) server** that exposes a small set of tools:
 
